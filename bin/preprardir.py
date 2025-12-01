@@ -73,8 +73,8 @@ def main(options, args):
 def copy_license_file(output_dir):
 	"""From WinRAR order.htm:
 	If you use WinRAR, you will need to copy the registration key file 
-	(rarreg.key) to a WinRAR folder or to %APPDATA%\WinRAR folder. By default 
-	WinRAR folder is "C:\Program Files\WinRAR", but it can be changed by a user
+	(rarreg.key) to a WinRAR folder or to %APPDATA%\\WinRAR folder. By default 
+	WinRAR folder is "C:\\Program Files\\WinRAR", but it can be changed by a user
 	when installing WinRAR.
 	
 	If you use RAR/Unix and RAR for OS X, you should copy rarreg.key to your 
@@ -120,12 +120,20 @@ def extract_rarbin(source, dest, unrar=locate_unrar()):
 			continue
 		elif not options.enable_beta and tag.beta:
 			continue
+		print('Processing', fname, end="... ")
 		archive_name = os.path.join(source, fname)
-		date, name = get_rar_date_name(archive_name)
+		try:
+			date, name = get_rar_date_name(archive_name)
+		except Exception as e:
+			print('fucked:', e)
+			continue
 		if date and name:
 			if tarfile.is_tarfile(archive_name):
 				new_name = date + "_rar%s" % tag
-				print("Extracting %s..." % new_name, end=" ")
+				if os.path.exists(os.path.join(dest, new_name)):
+					print(os.path.join(dest, new_name), 'already exists...')
+					continue
+				print("\nExtracting %s..." % new_name, end=" ")
 				with closing(tarfile.open(archive_name)) as tf:
 					exe = tf.getmember("rar/rar")
 					tf.extract(exe, path=dest)
@@ -140,13 +148,17 @@ def extract_rarbin(source, dest, unrar=locate_unrar()):
 					os.rmdir(os.path.join(dest, "rar"))
 			else:
 				new_name = date + "_rar%s.exe" % tag
+				if os.path.exists(os.path.join(dest, new_name)):
+					print(os.path.join(dest, new_name), 'already exists...')
+					continue
 				if ".sfx" in fname:
 					# no extension for Linux executables
 					new_name = new_name[:-4]
 				print("Extracting %s..." % new_name, end=" ")
 				args = [unrar, "e", archive_name, name, dest]
 				extract = custom_popen(args)
-				if extract.wait() in (0, 1):
+				extract.communicate()
+				if extract.returncode in (0, 1):
 					# Error code 1: when there is some corruption in the file
 					# Verifying authenticity information ...  Failed
 					# has been seen on wrar260.exe
@@ -155,16 +167,16 @@ def extract_rarbin(source, dest, unrar=locate_unrar()):
 						name = os.path.basename(name)
 						os.rename(os.path.join(dest, name),
 								  os.path.join(dest, new_name))
-						if extract.wait() == 1:
+						if extract.returncode == 1:
 							print("done. (Non fatal error(s) occurred)")
 						else:
 							print("done.")
-					except:  # WindowsError: # [Error 183]
+					except Exception as e:  # WindowsError: # [Error 183]
 						# ERROR_ALREADY_EXISTS
 						os.unlink(os.path.join(dest, name))
-						print("failed.")
+						print("failed:", e)
 				else:
-					print(RETURNCODE[extract.wait()])
+					print(RETURNCODE[extract.returncode])
 					# not sure the following is necessary
 					# but if the file is extracted to disk,
 					# remove it so the next steps can continue successfully
@@ -183,7 +195,7 @@ def get_rar_date_name(file_name):
 					t = block.file_datetime
 					return ("%d-%02d-%02d" % (t[0], t[1], t[2]),
 					                          block.os_file_name())
-			except Exception:
+			except Exception as e:
 				pass
 	elif tarfile.is_tarfile(file_name):
 		with closing(tarfile.open(file_name)) as tf:
@@ -236,7 +248,7 @@ def custom_popen(cmd):
 	"""disconnect cmd from parent fds, read only from stdout"""
 
 	# needed for py2exe
-	creationflags = 0
+	creationflags = subprocess.CREATE_NEW_CONSOLE
 	if sys.platform == 'win32':
 		creationflags = 0x08000000  # CREATE_NO_WINDOW
 

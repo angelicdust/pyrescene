@@ -74,8 +74,10 @@ if sys.hexversion < 0x3000000:
 	range = xrange #@ReservedAssignment @UndefinedVariable
 
 # internal byte constants
-RAR_MARKER_BLOCK = b"Rar!\x1a\x07\x00"
+RAR_MARKER_BLOCK = b"Rar!\x1a\x07"
+RAR4_MARKER_BLOCK = b"Rar!\x1a\x07\x00"
 RAR5_MARKER_BLOCK = b"Rar!\x1a\x07\x01\x00"
+EXE_HEADER_BLOCK = b'MZ\x90\x00\x03\x00\x00\x00'
 ZERO = b"\0"
 
 # default fallback charset
@@ -1234,8 +1236,12 @@ class RarPackedFileBlock(RarBlock): # 0x74
 	def ftime(self, timetuple):
 		"""Formats the time tuple to a string."""
 		if not timetuple:
-			return "UNKNOWN"		seconds = timetuple[5]		if int(seconds) != seconds:
-			# sub second precision			return "%04d-%02d-%02d %02d:%02d:%02.7f" % timetuple		else:
+			return "UNKNOWN"
+		seconds = timetuple[5]
+		if int(seconds) != seconds:
+			# sub second precision
+			return "%04d-%02d-%02d %02d:%02d:%02.7f" % timetuple
+		else:
 			return "%04d-%02d-%02d %02d:%02d:%02d" % timetuple
 
 	def get_compression_name(self):
@@ -1516,6 +1522,7 @@ class RarReader(object):
 	Raises EnvironmentError, ValueError, ArchiveNotFoundError
 	"""
 	RAR, SRR, SFX = list(range(3))
+	_readmode = None
 	
 	def __init__(self, rfile, file_length=0, enable_sfx=False):
 		"""If the file is a part of a stream, (e.g. RAR in SRR)
@@ -1557,17 +1564,8 @@ class RarReader(object):
 			# read 7 bytes so Usenet error correction can kick in
 			self._rarstream.seek(self._initial_offset)
 			bheader = self._rarstream.read(8)
-			if bheader == RAR5_MARKER_BLOCK:
-				self._rarstream.close()
-				msg = "This reader does not support RAR5 files!"
-				raise Rar5NotSupportedError(msg)
-			block_type = ord(bheader[2:3]) # third byte
-			if block_type == BlockType.RarMin: # 0x72
-				self._readmode = self.RAR
-			elif block_type == BlockType.SrrHeader: # 0x69
-				self._readmode = self.SRR
-				self.recovery_records_removed = True # init to be sure
-			elif enable_sfx: # SFX ?
+			if bheader == EXE_HEADER_BLOCK:
+				# check for PE header... certified SFX or invalid file
 				# TODO: make it resceneable
 				# search for RAR marker block offset
 				#    79280 for wrar400.exe
@@ -1580,18 +1578,37 @@ class RarReader(object):
 				self._initial_offset += offset
 				if offset < 0:
 					self._rarstream.close()
-					msg = "The file is not a valid .rar archive or .srr file."
-					raise ValueError(msg)
+					raise ValueError('not a valid SFX archive')
+				elif not enable_sfx:
+					self._rarstream.close()
+					raise ValueError('SFX support not enabled')
+					# fucked
 				# skip SFX data for length calculation
 				self._file_length -= offset
 				self._readmode = self.SFX
 				# What kind of errors if SRR is detected as SFX?
 				#	 srr_detected_as_sfx.exe EnvironmentError: 
 				#	 Invalid RAR block length (46325) at offset 0x124
+
+				# reset for second block header pass
+				self._rarstream.seek(self._initial_offset)  # seek to start of SFX and
+				bheader = self._rarstream.read(8)  # re-read block header
+
+			if bheader == RAR5_MARKER_BLOCK:
+				self._rarstream.close()
+				msg = "This reader does not support RAR5 files!"
+				raise Rar5NotSupportedError(msg)
+			elif bheader.startswith(RAR4_MARKER_BLOCK):
+				if self._readmode != self.SFX:
+					block_type = ord(bheader[2:3]) # third byte
+					if block_type == BlockType.RarMin: # 0x72
+						self._readmode = self.RAR
+					elif block_type == BlockType.SrrHeader: # 0x69
+						self._readmode = self.SRR
+						self.recovery_records_removed = True # init to be sure
 			else:
 				self._rarstream.close()
-				msg = "SFX support not enabled or not a RAR archive."
-				raise ValueError(msg)
+				raise ValueError('not a RAR archive')
 		self._rarstream.seek(self._initial_offset)
 		self._current_index = 0
 		self._rar_end_block_encountered = False # for detecting padding
