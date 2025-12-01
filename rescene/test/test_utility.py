@@ -50,6 +50,7 @@ from rescene.utility import SfvEntry, parse_sfv_file, parse_sfv_data
 from rescene.utility import filter_sfv_duplicates, same_sfv
 from rescene.utility import is_rar, next_archive, is_good_srr, first_rars, sep
 from rescene.utility import capitalized_fn
+from rescene.utility import DISK_FOLDERS, RELEASE_FOLDERS 
 
 # for running nose tests
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -218,7 +219,7 @@ class TestUtility(unittest.TestCase):
 		self.assertTrue(is_rar("test.999"))
 		self.assertTrue(is_rar("test.v99"))
 		self.assertTrue(is_rar("test.part1.rar"))
-		self.assertFalse(is_rar("test.w66"))
+		# self.assertFalse(is_rar("test.w66"))  # made by rar.exe when needed
 		self.assertFalse(is_rar("testrar"))
 
 	def test_next_rar(self):
@@ -249,7 +250,7 @@ class TestUtility(unittest.TestCase):
 
 	def test_is_good(self):
 		self.assertTrue(is_good_srr("good- #@&$§£~(){}[]!çéè"))
-		for char in """\:*?"<>|""":
+		for char in r"""\:*?"<>|""":
 			self.assertFalse(is_good_srr("not" + char + "good"))
 
 	def test_first_rars(self):
@@ -259,7 +260,7 @@ class TestUtility(unittest.TestCase):
 		self.assertEqual(["test.part01.rar"], first_rars(t))
 		t = ["test.part003.rar", "test.part020.rar", "test.part001.rar"]
 		self.assertEqual(["test.part001.rar"], first_rars(t))
-		t = ["test3.rar", "test20.rar", "test.part0001.rar"]
+		t = ["test3.rar", "test20.rar", "test.part0001.rar", "9.rar"]
 		self.assertEqual(t, first_rars(x for x in t))
 		# 000 or 001 should be the first RAR
 		t = ["name.000", "name.001", "name.002"]
@@ -268,6 +269,8 @@ class TestUtility(unittest.TestCase):
 		self.assertEqual(["name.001", "other.000"], first_rars(t))
 		t = ["name.003", "name.004", "name.007"]
 		self.assertEqual([], first_rars(t))
+		t = ["part1.rar", "part2.rar"]
+		self.assertEqual([], first_rars(t))  # TODO: this is ok?
 
 	def test_first_rars_bug(self):
 		t = ["name.part2.r00", "name.part2.r01", "name.part2.rar"]
@@ -336,7 +339,7 @@ class TestUtility(unittest.TestCase):
 			self.assertEqual(sep(1000000, en), "1,000,000")
 			if int(platform.win32_ver()[0]) >= 8:
 				# \xa0 on Windows 8 (non-breaking space)
-				self.assertEqual(sep(1000000, nl), b"1\xa0000\xa0000")
+				self.assertEqual(sep(1000000, nl), "1\xa0000\xa0000")
 			else:
 				# Windows 7 and lower
 				self.assertEqual(sep(1000000, nl), "1.000.000")
@@ -444,3 +447,39 @@ class TestUtility(unittest.TestCase):
 			self.assertEqual(h, ofile.upper(), "not with capitals")
 		finally:
 			os.chdir(cwd)
+
+class TestReleaseRegex(unittest.TestCase):
+	def test_disk_folders(self):
+		self.assertTrue(DISK_FOLDERS.match("cd1"))
+		self.assertTrue(DISK_FOLDERS.match("cd.1"))
+		self.assertTrue(DISK_FOLDERS.match("cd_1"))
+		self.assertTrue(DISK_FOLDERS.match("Disk1"))
+		self.assertTrue(DISK_FOLDERS.match("Disc1"))
+		self.assertTrue(DISK_FOLDERS.match("DVD.11"))
+		self.assertTrue(DISK_FOLDERS.match("PART1"))
+		self.assertTrue(DISK_FOLDERS.match("Disc1_A.Long.disk_title"))
+		self.assertTrue(DISK_FOLDERS.match("Disc1.Leon"))
+		self.assertTrue(DISK_FOLDERS.match("Disc1_Leon"))
+		self.assertTrue(DISK_FOLDERS.match("Disc1-Leon"))
+		self.assertTrue(DISK_FOLDERS.match("CD1-Dont_Cross_Me"))
+
+		# the - could give problems with actual releases
+		self.assertFalse(DISK_FOLDERS.match("Disc1_A.Long-disk_title"))
+		self.assertFalse(DISK_FOLDERS.match("DVD2oneX2.v2.1.2.MacOSX.UB-Lz0"))
+		
+	def test_release_folders(self):
+		self.assertTrue(RELEASE_FOLDERS.match("Disc_1"))
+		self.assertTrue(RELEASE_FOLDERS.match("Sample"))
+		self.assertTrue(RELEASE_FOLDERS.match("Samples"))
+		self.assertTrue(RELEASE_FOLDERS.match("VobSample"))
+		self.assertTrue(RELEASE_FOLDERS.match("VobSamples"))
+		self.assertTrue(RELEASE_FOLDERS.match("Cover"))
+		self.assertTrue(RELEASE_FOLDERS.match("Covers"))
+		self.assertTrue(RELEASE_FOLDERS.match("PROOF"))
+		self.assertTrue(RELEASE_FOLDERS.match("Proofs"))
+		self.assertTrue(RELEASE_FOLDERS.match("Subs"))
+		self.assertTrue(RELEASE_FOLDERS.match("Subpack"))
+		self.assertTrue(RELEASE_FOLDERS.match("vobsubs"))
+		self.assertTrue(RELEASE_FOLDERS.match("vobsub"))
+		self.assertFalse(RELEASE_FOLDERS.match("Bluray1"))
+		self.assertFalse(RELEASE_FOLDERS.match("PROOOF"))

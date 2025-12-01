@@ -41,13 +41,11 @@ import zlib
 import re
 
 import hashlib
-import nntplib
 import collections
 
 import time
 import shutil
 import subprocess
-import multiprocessing
 
 import rescene
 from rescene.rar import (BlockType, RarReader, Rar5NotSupportedError,
@@ -64,13 +62,14 @@ from rescene.utility import decodetext, encodeerrors
 from rescene.utility import capitalized_fn
 from rescene.utility import calculate_crc32
 from rescene.osohash import osohash_from
+from rescene.utility import FileType
 from rescene.zip import ZipReader, ZIP_EXT, ZipFileBlock
 from rescene.rar5 import parse_rar5
 
 # compatibility with 2.x
 if sys.hexversion < 0x3000000:
 	# prefer 3.x behavior
-	range = xrange #@ReservedAssignment
+	range = xrange # pyright: ignore[reportUndefinedVariable] #@ReservedAssignment
 
 try:  # Python 3
 	from functools import partial
@@ -128,9 +127,13 @@ class Observer(object):
 
 class MsgCode(object):
 	MSG, OS_ERROR, NO_OVERWRITE, NO_EXTRACTION, DUPE, STORING, FILE_NOT_FOUND,\
-	NO_FILES, DEL_STORED_FILE, RENAME_FILE, CMT, AV, AUTHENTCITY, \
+	NO_FILES, DEL_STORED_FILE, RENAME_FILE, CMT, AV, ACL, AUTHENTCITY, \
 	NO_RAR, BLOCK, FBLOCK, RBLOCK, COMPRESSION, UNSUPPORTED_FLAG, CRC,  \
-	USER_ABORTED, AUTO_LOCATE, UNKNOWN = list(range(23))
+	USER_ABORTED, AUTO_LOCATE, UNKNOWN = list(range(24))
+	
+	# informative messages not printed to stderr
+	informative = [MSG, STORING, DEL_STORED_FILE,
+	               BLOCK, RBLOCK, FBLOCK, COMPRESSION]
 
 class DupeFileName(Exception):
 	"""A file already exists with the given name."""
@@ -612,6 +615,10 @@ def create_srr(srr_name, infiles, in_folder="",
 		# STORE OSO/ISDb HASHES
 		if oso_hash:
 			for (fname, rarname) in oso_dict.items():
+				# skip over the many files in PS3 and PS4 releases
+				ext = os.path.splitext(fname)[1].lower()
+				if ext not in FileType.VideoExtensions:
+					continue
 				try:
 					oso_hash, file_size = osohash_from(rarname, fname, True)
 					block = SrrOsoHashBlock(file_size=file_size, 
@@ -651,6 +658,7 @@ def create_srr_single_volume(srr_name, infile, tmp_srr_name=None):
 	
 	Returns True: success
 	Returns False: existing .srr file not overwritten
+	Throws error on broken RAR files.
 	"""
 	try:
 		if not tmp_srr_name:
@@ -697,6 +705,13 @@ def create_srr_single_volume(srr_name, infile, tmp_srr_name=None):
 def _rarreader_usenet(rarfile, read_retries=7):
 	"""Tries redownloading data read_retries times if it fails.
 	Regular RarReader, but handles Usenet exceptions and retries."""
+	try:
+		import nntplib
+	except:
+		print("nntplib is not available in Python 3.12+")
+		print("Run: pip install standard-nntplib==3.13 to fix this")
+		exit(1)
+
 	rr = RarReader(rarfile)
 	try:
 		return rr.read_all()
@@ -1126,12 +1141,14 @@ def info(srr_file):
 				msg = "New style comment block found."
 				if _DEBUG: print(msg)
 				_fire(MsgCode.CMT, message=msg)
-
 			elif block.file_name == "AV":
 				msg = "Authenticity Verification block found."
 				if _DEBUG: print(msg)
 				_fire(MsgCode.AV, message=msg)
-				
+			elif block.file_name == "ACL":
+				msg = "NTFS Access Control List block found."
+				if _DEBUG: print(msg)
+				_fire(MsgCode.ACL, message=msg)
 			else:
 				msg = "Unexpected new-style RAR block. New RAR version?"
 				if _DEBUG: print(msg)
@@ -1162,11 +1179,13 @@ def info(srr_file):
 			
 		# calculate size of RAR file
 		if current_rar:
+			#if add_size: # FIXME: WTF?
 			if count_size:
-				current_rar.file_size += block.header_size + block.add_size
-				# not the whole size for the padding block (7 + 4 add size)
-				if block.rawtype == BlockType.SrrRarPadding:
-					current_rar.file_size -= block.header_size  # - 11
+				# don't include the header size when padding is used
+				# CREEPSHOW uses padding in their volumes
+				if block.rawtype != BlockType.SrrRarPadding:
+					current_rar.file_size += block.header_size
+				current_rar.file_size += block.add_size
 			current_rar.offset_end_rar = (block.block_position + 
 			                              block.header_size)
 			rar_files[current_rar.key] = current_rar	
@@ -1244,11 +1263,18 @@ def print_details(file_path):
 		
 	srr_hash = content_hash(file_path)
 	print("SRR sha1 content hash: %s" % srr_hash)
-			
+
+class RarMtSettings(object):	
+	"""Interface options to determine the rar -mt parameter"""
+	def __init__(self):
+		self.mt_set = []
+		self.mt_min = 0
+		self.mt_max = 0
+
 def reconstruct(srr_file, in_folder, out_folder, extract_paths=True, hints={},
 				skip_rar_crc=False, auto_locate_renamed=False, empty=False,
 				rar_executable_dir=None, tmp_dir=None, extract_files=True,
-				srr_part=""):
+				srr_part="", rar_mt=None):
 	"""
 	srr_file: SRR file of the archives that need to be rebuild
 	in_folder: root folder in which we start looking for the files
@@ -1266,6 +1292,7 @@ def reconstruct(srr_file, in_folder, out_folder, extract_paths=True, hints={},
 	tmp_dir: working directory for compressed RAR reconstruction
 	extract_files: if set, extract additional files stored in the srr
 	srr_part: string with volume(s) to reconstruct
+	rar_mt: object with settings for the rar -mt parameter
 	"""
 	rar_name = ""
 	ofile = ""
@@ -1275,6 +1302,8 @@ def reconstruct(srr_file, in_folder, out_folder, extract_paths=True, hints={},
 	rebuild_recovery = False
 	running_crc = 0  # of bytes used in packaging a single file accross volumes
 	compressed_block_encountered = False  # mixed blocks e.g. .PNG file
+	if rar_mt:
+		RarArguments.mt_settings = rar_mt
 	
 	skip_volume = False # helps to reconstruct a single volume
 	skip_offset = 0
@@ -1287,7 +1316,12 @@ def reconstruct(srr_file, in_folder, out_folder, extract_paths=True, hints={},
 	if rar_executable_dir:
 		initialize_rar_repository(rar_executable_dir)
 		if not repository.count():
-			_fire(MsgCode.MSG, message="No RAR executables found.")
+			_fire(MsgCode.MSG, message="No RAR executables found.\n" 
+				"The -z folder must contain extracted rar executables that are"
+				"\nthe result of the preprardir.py script. These rars have\n"
+				"a specific file name containing the date and version.\n"
+				"e.g. 2012-06-09_rar420.exe or 2016-01-10_rar531b1.exe\n"
+				"http://rescene.wikidot.com/tutorials#compressed")
 			return False
 	
 	blocks = RarReader(srr_file).read_all()
@@ -1696,6 +1730,7 @@ def _search(files, folder=""):
 	folder = escape_glob(folder)
 
 	for file_name in files:
+		file_name = escape_glob(file_name)
 		# use path relative to folder if the path isn't relative or absolute 
 		if (os.path.isabs(file_name) or file_name.startswith(os.pardir)):
 			search_name = file_name
@@ -1858,9 +1893,9 @@ class RarExecutable(object):
 		self.args = None
 		
 		# parse file name
-		match = re.match("(?P<date>\d{4}-\d{2}-\d{2})_rar"
-		                 "(?P<major>\d)(?P<minor>\d\d)"
-		                 "(?P<beta>b\d)?(\.exe)?", rar_sfx_file)
+		match = re.match(r"(?P<date>\d{4}-\d{2}-\d{2})_rar"
+		                 r"(?P<major>\d)(?P<minor>\d\d)"
+		                 r"(?P<beta>b\d)?(\.exe)?", rar_sfx_file)
 		if match:
 			self.date, self.major, self.minor, self.beta = match.group(
 				"date", "major", "minor", "beta")
@@ -1886,6 +1921,7 @@ class RarExecutable(object):
 	def max_thread_count(self):
 		"""
 		Ignores whether or not this version can set threads!
+		The first rar version to support --mt is 2006-03-29_rar360b1.exe
 		4.20: Now the allowed <threads> value for -mt<threads> switch is
 		1 - 32, not 0 - 16 as before. (also in 4.20 beta 1)
 		"""
@@ -1894,6 +1930,16 @@ class RarExecutable(object):
 			return 16
 		else:
 			return 32
+
+	def min_thread_count(self):
+		"""
+		Before 4.20 the threads are 0 - 16, after that it's 1 - 32
+		"""
+		if (int(self.major) < 4 or
+			int(self.major) == 4 and int(self.minor) < 20):
+			return 0
+		else:
+			return 1
 		
 	def __lt__(self, other):
 		"""
@@ -1921,6 +1967,8 @@ class RarArguments(object):
 	-sv     Create independent solid volumes
 	-sv-    Create dependent solid volumes
 	"""
+	mt_settings = RarMtSettings()
+	
 	def __init__(self, block, rar_archive, store_files):
 		self.compr_level = block.get_compression_parameter()
 		self.dict_size = block.get_dictionary_size_parameter()
@@ -1938,22 +1986,45 @@ class RarArguments(object):
 		self.threads = ""
 		self.split = ""
 		self.old_naming_flag = "-vn"
+		self.force_rar4_flag = ""
 		
 	def increase_thread_count(self, rarbin):
-		"""Call supports_setting_threads() before calling this method"""
-		if self.threads == "":
-			self.threads = "-mt1"
-			return True
+		# <threads> parameter can take values from 0 to 16.
+		# 4.20: Now the allowed <threads> value for -mt<threads> switch is
+		# 1 - 32, not 0 - 16 as before.
+		mtcount = rarbin.max_thread_count()
+		mt_min = rarbin.min_thread_count()
+		mt_max = mtcount
+		if RarArguments.mt_settings.mt_min > 0:
+			mt_min = RarArguments.mt_settings.mt_min
+		if RarArguments.mt_settings.mt_max > 0:
+			mt_max = RarArguments.mt_settings.mt_max
+
+		if not self.threads:
+			if self.mt_settings.mt_set:
+				for count in self.mt_settings.mt_set:
+					in_range = mt_min <= count <= mt_max and count <= mtcount
+					if in_range:
+						self.threads = "-mt%d" % count
+						return True
+				return False  # bad settings given: nothing to try
+			elif mt_min <= mtcount:
+				self.threads = "-mt%d" % mt_min
+				return True
+			else:
+				return False  # mt_min parameter is above max_thread_count
 		else:
-			current_count = int(self.threads[3:])
-			# <threads> parameter can take values from 0 to 16.
-			# 4.20: Now the allowed <threads> value for -mt<threads> switch is
-			# 1 - 32, not 0 - 16 as before.
-			max_threads = multiprocessing.cpu_count() * 2
-			mtcount = rarbin.max_thread_count()	
-			if max_threads > mtcount:
-				max_threads = mtcount 
-			if current_count < max_threads:
+			current_count = self.thread_count()
+			if self.mt_settings.mt_set:
+				for count in self.mt_settings.mt_set:
+					in_range = (mt_min <= count <= mt_max and 
+					            count <= mtcount and
+					            count > current_count)
+					if in_range:
+						self.threads = "-mt%d" % count
+						return True
+				return False  # no next possibility in list
+			elif current_count < mtcount and current_count < mt_max:
 				self.threads = "-mt%d" % (current_count + 1)
 				return True
 		return False
@@ -1968,6 +2039,7 @@ class RarArguments(object):
 			["a", self.compr_level, self.dict_size, 
 			self.solid, self.solid_namesort, self.threads,
 			self.old_naming_flag, # old style volume naming scheme
+			self.force_rar4_flag,
 			"-o+", # Overwrite all
 			"-ep", # Exclude paths from names.
 			"-idcd", # Disable messages: copyright string, "Done" string
@@ -2025,6 +2097,9 @@ class RarArguments(object):
 
 	def set_rar2_flags(self, rar2_detected):
 		self.old_naming_flag = "" if rar2_detected else "-vn"
+
+	def set_rar4_flags(self, rar5_detected):
+		self.force_rar4_flag = "-ma4" if rar5_detected else ""
 	
 def compressed_rar_file_factory(block, blocks, src,
 	                            in_folder, hints, auto_locate_renamed):
@@ -2160,7 +2235,7 @@ def get_set(srr_rar_block):
 	This function tries to pick the basename of such a set.
 	"""
 	n = srr_rar_block.file_name[:-4]
-	match = re.match("(.*)\.part\d*$", n, re.I)
+	match = re.match(r"(.*)\.part\d*$", n, re.I)
 	if match:
 		return match.group(1)
 	else:
@@ -2293,7 +2368,8 @@ class CompressedRarFile(io.IOBase):
 		size_full = block.unpacked_size
 #		assert size_full == os.path.getsize(self.source_files[-1])
 		size_min = block.packed_size
-		
+		using_piece = True
+
 		# RELOADED custom RAR packer: figure out correct file size
 		if (block.unpacked_size == 0xffffffffffffffff):
 			srr_file = block.fname
@@ -2311,6 +2387,7 @@ class CompressedRarFile(io.IOBase):
 		# Rar 2.0x version don't have a CRC stored, only at the end
 		# do the complete file
 		if block.file_crc == 0xFFFFFFFF:
+			using_piece = False
 			args = RarArguments(block, out, [self.source_files[0]])
 			old = True
 		else:
@@ -2322,6 +2399,7 @@ class CompressedRarFile(io.IOBase):
 			# we assume that newer versions always compress better
 			rarexe = repository.get_most_recent_version()
 			args.set_rar2_flags(re.search(r'_rar2', rarexe.path()) is not None)
+			args.set_rar4_flags(re.search(r'_rar[56]', rarexe.path()) is not None)
 			
 			window_size = block.get_dict_size()
 			amount = 0
@@ -2369,6 +2447,8 @@ class CompressedRarFile(io.IOBase):
 #		args.threads = thread_count
 			
 		def try_rar_executable(rar, args, old=False):
+			args.set_rar2_flags(re.search(r'_rar2', rar.path()) is not None)
+			args.set_rar4_flags(re.search(r'_rar[56]', rar.path()) is not None)
 			compress = custom_popen([rar.path()] + args.arglist())
 			stdout, _ = compress.communicate()
 			
@@ -2382,8 +2462,8 @@ class CompressedRarFile(io.IOBase):
 			# check if this is a good RAR version
 			start = size_min
 			ps = crc = 0
-			with RarStream(out, compressed=True,
-						packed_file_name=os.path.basename(piece)) as rs:
+			pfn = os.path.basename(args.store_files[0])
+			with RarStream(out, compressed=True, packed_file_name=pfn) as rs:
 				if old:
 					start = rs.length()
 #				print("Compressed: %d" % rs.length())
@@ -2443,12 +2523,14 @@ class CompressedRarFile(io.IOBase):
 			return False
 		
 		# do not split when WinRAR didn't do it either
-		if os.path.getsize(piece) != size_full:
+		
+		if os.path.isfile(piece) and os.path.getsize(piece) != size_full:
 			args.set_split(int(os.path.getsize(piece) * 0.6))
 			
 		for rar in repository.get_rar_executables(self.get_most_recent_date()):
 			_fire(MsgCode.MSG, message="Trying %s." % rar)
 			args.set_rar2_flags(re.search(r'_rar2', rar.path()) is not None)
+			args.set_rar4_flags(re.search(r'_rar[56]', rarexe.path()) is not None)
 			found = False
 			if rar.supports_setting_threads():
 				while args.increase_thread_count(rar):
@@ -2485,7 +2567,9 @@ class CompressedRarFile(io.IOBase):
 
 			args.reset_extra_files()			
 			args.threads = ""
-		os.remove(piece)
+
+		if using_piece:
+			os.remove(piece)
 	
 	def set_new(self, source_file, block, followup_src=None):
 		"""when solid, it can occur that the first file needs the second
@@ -2524,7 +2608,7 @@ class CompressedRarFile(io.IOBase):
 		# need 4 threads
 		if self.rarstream.length() != block.packed_size:
 			_fire(MsgCode.MSG, message="Solid archive recompression.")
-			while(self.rarstream.length() != block.packed_size and
+			while(self.rarstream.length() != block.packed_size and 
 				self.good_rar.supports_setting_threads() and
 				self.good_rar.args.increase_thread_count(self.good_rar)):
 				compress()
@@ -2634,6 +2718,8 @@ def calculate_size_volume(blocks):
 		elif block.rawtype in (BlockType.SrrHeader, BlockType.SrrStoredFile,
 		                       BlockType.SrrRarFile, BlockType.SrrOsoHash):
 			continue
+		elif block.rawtype == BlockType.SrrRarPadding:
+			size += block.add_size
 		else:
 			size += block.header_size
 			size += block.add_size

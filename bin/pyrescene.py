@@ -24,7 +24,7 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-"""
+r"""
 This tool creates an SRR file from a release directory.
 
 design decisions:
@@ -52,6 +52,14 @@ import time
 import logging
 import itertools
 import traceback
+import struct
+
+try:
+	import imghdr
+except ModuleNotFoundError:
+	print("imghdr is not available in Python 3.12+")
+	print("Run: pip install standard-imghdr==3.13 to fix this")
+	exit(1)
 
 try:
 	import win32api
@@ -77,6 +85,7 @@ from rescene.utility import raw_input, unicode, fsunicode
 from rescene.utility import decodetext, encodeerrors
 from rescene.utility import create_temp_file_name, replace_result
 from rescene.utility import capitalized_fn
+from rescene.utility import DISK_FOLDERS, RELEASE_FOLDERS 
 
 o = rescene.Observer()
 rescene.subscribe(o)
@@ -84,6 +93,38 @@ rescene.subscribe(o)
 rescene.change_rescene_name_version("pyReScene Auto %s" % rescene.__version__)
 
 unrar_executable = None
+
+def rar_file_blacklist():
+	return [
+# these RARs contain cracked .exe files and are not wanted on srrdb.com
+"BEYOND.THE.FUTURE.FIX.THE.TIME.ARROWS.EBOOT.PATCH.100.JPN.PS3-N0DRM",
+"The.Raven.Legacy.of.a.Master.Thief.FIX-RELOADED",
+"CHAMPIONSHIP.MANAGER.2003.2004.UPDATE.V4.1.3.PATCH.FIX.CRACKED-DEViANCE",
+"CHAMPIONSHIP.MANAGER.2003.2004.UPDATE.V4.1.4.TIMER.FIX.CRACKED-DEViANCE",
+"CHROME.CRACK.FIX-DEViANCE",
+"F1.Racing.Championship.FIX.READ.NFO-HOTDOX",
+"Hunting_Unlimited_3_V1.1_NOCD_CRACK_NFOFIX-RVL",
+"LMA.Manager.2007.FiX-RELOADED",
+"MSC.PATRAN.V2001.R2A.FIX.FOR.RISE-TFL",
+"RUNAWAY.A.ROAD.ADVENTURE.FIX-DEViANCE",
+"Company.of.Heroes.Tales.of.Valor.FIX.GERMAN-0x0007",
+"Dishonored.GERMAN.FIX-0x0007",
+"OPERATION.FLASHPOINT.RESISTANCE.ADDON.FIX-DEViANCE",
+"Deus.Ex.Mankind.Divided.A.Criminal.Past.DLC.FIX-SKIDROW",
+# contains vobsubs
+"Bubble.Boy.DVDRip.DiVX.FIX-FIXRUS",
+"Herbie.Fully.Loaded.SUB.FIX-DiAMOND",
+# missing file main release
+"Super.Streetfighter.IV.SSFIV.Arcade.Edition.DLC.FIX.READNFO.XBOX360-MoNGoLS",
+"Arrested.Development.S02E07.FiX.DVDRip.XviD-SAPHiRE",
+"Friends.Trivia.Game.GERMAN.LAME.SITE.SCRIPTS.FIX-SiLENTGATE",
+"Warhammer.40000.Dawn.Of.War.Winter.Assault.GERMAN.CD2.LAME.SITE.SCRIPTS.FIX-SiLENTGATE",
+"Broken.Oath.1977.DVDRiP.XviD.DiRFiX-GREiD",
+"Abraham.Lincoln.Vs.Zombies.3D.2012.1080p.BluRay.RAR.FiX.x264-LiViDiTY",
+# TODO: never include .rar with .iso, .mkv file
+"Game.Of.Thrones.S3.D4.RAR.FIX.MULTiSUBS.COMPLETE.BLURAY-CLASSiC",
+"OPUS.Rocket.of.Whispers.RAR.FIX-TiNYiSO",
+		]
 
 def get_unrar():
 	"""Locate unrar executable only once"""
@@ -169,6 +210,156 @@ def get_music_files(reldir):
 	return (get_files(reldir, "*.mp3") + get_files(reldir, "*.mp2") +
 			get_files(reldir, "*.flac"))
 
+PROOF_IMAGE_EXTS = [".jpg", "jpeg", ".png", ".bmp", ".gif"]
+
+def get_proof_files(reldir, more_images=False):
+	"""
+	Includes proofs, proof RAR files, image files in Sample directories.
+	Images from Cover(s)/ folder. Mostly seen on XXX and DVDR releases.
+	Images in /Compare The.Game.1997.720p.REMASTERED.INTERNAL.BluRay.x264-DAA
+	Images in /Screenshots CSI.Miami.S03E02.HDTV.XviD.PROPER-LOL
+	"""
+	image_files = []
+	for ext in PROOF_IMAGE_EXTS:
+		image_files += get_files(reldir, "*" + ext)
+	rar_files = get_files(reldir, "*.rar")
+
+	result = filter_proof_image_files(
+		image_files, rar_files, reldir, more_images)
+	result += filter_proof_rar_files(rar_files)
+
+	return result
+
+def filter_proof_image_files(image_files, rar_files, reldir, more_images):
+	include_in_srr = []
+	for proof in image_files:
+		# images in Sample, Proof and Cover(s) subdirs are ok
+		# others need to contain the word proof in their path
+		lproof = proof.lower()
+		if ("proof" in lproof or "sample" in lproof or
+			os.sep + "cover" in lproof or
+			os.sep + "screenshots" in lproof or
+			os.sep + "compare" in lproof):
+			include_in_srr.append(proof)
+			continue
+
+		if always_skip(proof, lproof):
+			continue
+		if more_images or store_rls_root(proof, rar_files, reldir):
+			include_in_srr.append(proof)
+	return include_in_srr
+
+def always_skip(proof, lproof):
+	# proof file in root directory without the word 'proof' in the name 
+	# no spaces: skip personal covers added to mp3 releases
+	# (proof files with spaces exist, but pzs-ng replaces those with . or _)
+	# Windows Media Player 11:
+	# creates Folder.jpg, AlbumArtSmall.jpg, desktop.ini
+	# AlbumArt_{7E518F75-1BC4-4CD1-92B4-B349D9E9248B}_Large.jpg
+	# AlbumArt_{7E518F75-1BC4-4CD1-92B4-B349D9E9248B}_Small.jpg
+	always_skip = (" " in os.path.basename(proof) or
+		os.path.splitext(lproof)[0].endswith("folder") or
+		"albumartsmall" in os.path.basename(lproof) or
+		os.path.basename(lproof).startswith("albumart_{"))
+	return always_skip
+
+def store_rls_root(proof, rar_files, reldir):
+	skip_tpl = "'{0}' ({1} B) not added to SRR for release {2}"
+
+	# Start with 00 for mp3 releases. Mostly 00- but 00_ exists too:
+	# VA-Psychedelic_Wild_Diffusion_Part_1-(ESPRODCD01)-CD-2007-hM
+	# ATB_-_Seven_Years-Ltd.Ed.-2005-MOD (small JPG image file)
+	# or 000- and 01- or 01_
+	if os.path.basename(proof).startswith(("00", "01", "001")):
+		return True
+
+	# idea is to not have covers that are added later
+	# non music releases have a separate folder
+	if os.path.getsize(proof) > 100000:
+		# must be named like nfo/sfv/rars
+		similar_named = similar_to_good_name(proof, rar_files, reldir)
+		
+		if similar_named and not fixed_resolution_cover(proof):
+			return True
+		else:
+			msg = skip_tpl.format(
+				os.path.basename(proof),
+				rescene.utility.sep(os.path.getsize(proof)),
+				os.path.basename(reldir))
+			logging.info(msg)
+			print(msg)
+	else:
+		# Depeche_Mode-Singles_Box_1-6CD-2004-AMOK
+		# smaller proofs can exist too: use the -i parameter
+		# -> but .startswith("00") already includes those
+		# Extra -i option added to add all image files
+		# and have no separate detection.
+		# -> but even directly from topsite there can be
+		#    additional unwanted files e.g. imdb image files
+		# small JPGs are more likely site grabs by scripts
+
+		# log and print the small files info too
+		msg = skip_tpl.format(
+			os.path.basename(proof),
+			rescene.utility.sep(os.path.getsize(proof)),
+			os.path.basename(reldir))
+		logging.info(msg)
+		print(msg)
+	return False
+
+def similar_to_good_name(lproof, rar_files, reldir):
+	basenames = collect_known_good_filenames(reldir, rar_files)
+	s = 10  # first X characters
+	p = os.path.basename(lproof)
+
+	# for music releases, NFOs not always start with 00
+	# while all the other files do (sfv, m3u, jpg, cue,...)
+	# e.g. Hmc_-_187_(UDR011)-VLS-1996-TR
+	for bn in basenames:
+		if (bn[:s].lower() == p[:s] or
+			strip_zeros(bn)[:s].lower() == strip_zeros(p)[:s]):
+			return True
+		else:
+			# checks possible group name before the extension
+			# e.g. Global_Underground_017_-_Danny_Tenaglia
+			# _(London)-2000-tronik
+			#   /gu_017_tracklisting-tronik.jpg
+			#   /00-global_underground_017_-_danny_tenaglia
+			#     _(london)-2000-tronik.sfv
+			#   /01_gu_017_-_london_(cd_1)-tronik.cue
+			grprls = bn.lower().split('-')[-1]
+			grpimg = os.path.splitext(lproof)[0].split('-')[-1]
+			if grprls == grpimg:
+				return True
+	return False
+
+def collect_known_good_filenames(reldir, rar_files):
+	# grab all interesting extensions
+	checklist = (get_files(reldir, "*.sfv") + get_files(reldir, "*.nfo") +
+				 get_files(reldir, "*.m3u") + rar_files)
+	return (os.path.basename(good_name)[:-4] for good_name in checklist)
+
+def filter_proof_rar_files(rar_files):
+	include_in_srr = []
+	for proof in rar_files:
+		# RAR file must contain image file
+		# Space.Dogs.3D.2010.GERMAN.1080p.BLURAY.x264-HDViSiON (bmp proof)
+		if "proof" in proof.lower() and has_stored_proof_ext(proof):
+			include_in_srr.append(proof)
+	return include_in_srr
+
+def has_stored_proof_ext(proof_rarfile):
+	try:
+		for block in RarReader(proof_rarfile):
+			if (block.rawtype == BlockType.RarPackedFile and
+				block.file_name[-4:].lower() in PROOF_IMAGE_EXTS):
+					return True
+	except ValueError as e:
+		# No RAR5 support yet
+		logging.warning("{0}: {1}".format(str(e), proof_rarfile))
+
+	return False
+
 def strip_zeros(file_name):
 	"""Sometimes the covers don't have the same leading characters as
 	the .nfo and .sfv file. In this case the .nfo file is most likely
@@ -181,119 +372,62 @@ def strip_zeros(file_name):
 		return file_name[5:]
 	else:
 		return file_name
+	
+def fixed_resolution_cover(root_image):
+	"""Cut off movie poster image most likely added by a site script"""
+	try:
+		width, height = get_image_size(root_image)
+		return width == 630 and height == 1200
+	except TypeError:
+		return False;
 
-def get_proof_files(reldir):
-	"""
-	Includes proofs, proof RAR files, image files in Sample directories.
-	Images from Cover(s)/ folder. Mostly seen on XXX and DVDR releases.
-	"""
-	image_files = (get_files(reldir, "*.jpg") + get_files(reldir, "*.png") +
-	               get_files(reldir, "*.gif") + get_files(reldir, "*.bmp") +
-	               get_files(reldir, "*.jpeg"))
-	rar_files = get_files(reldir, "*.rar")
-	result = []
-	for proof in image_files:
-		# images in Sample, Proof and Cover(s) subdirs are ok
-		# others need to contain the word proof in their path
-		lproof = proof.lower()
-		if ("proof" in lproof or "sample" in lproof or
-			os.sep + "cover" in lproof):
-			result.append(proof)
+# image resolution check from https://stackoverflow.com/a/39778771/654160
+def test_jpeg(h, _f):
+	# SOI APP2 + ICC_PROFILE
+	if h[0:4] == b"\xff\xd8\xff\xe2" and h[6:17] == b"ICC_PROFILE":
+		return "jpeg"
+	# SOI APP14 + Adobe
+	if h[0:4] == b"\xff\xd8\xff\xee" and h[6:11] == b"Adobe":
+		return "jpeg"
+	# SOI DQT
+	if h[0:4] == "\xff\xd8\xff\xdb":
+		return "jpeg"
+imghdr.tests.append(test_jpeg)
+
+def get_image_size(fname):
+	"""Determine the image type of fhandle and return its size. from draco"""
+	with open(fname, "rb") as fhandle:
+		head = fhandle.read(24)
+		if len(head) != 24:
+			return
+		what = imghdr.what(None, head)
+		if what == "png":
+			check = struct.unpack(">i", head[4:8])[0]
+			if check != 0x0d0a1a0a:
+				return
+			width, height = struct.unpack(">ii", head[16:24])
+		elif what == "gif":
+			width, height = struct.unpack("<HH", head[6:10])
+		elif what == "jpeg":
+			try:
+				fhandle.seek(0)  # Read 0xff next
+				size = 2
+				ftype = 0
+				while not 0xc0 <= ftype <= 0xcf or ftype in (0xc4, 0xc8, 0xcc):
+					fhandle.seek(size, 1)
+					byte = fhandle.read(1)
+					while ord(byte) == 0xff:
+						byte = fhandle.read(1)
+					ftype = ord(byte)
+					size = struct.unpack(">H", fhandle.read(2))[0] - 2
+				# We are at a SOFn block
+				fhandle.seek(1, 1)  # Skip `precision" byte.
+				height, width = struct.unpack(">HH", fhandle.read(4))
+			except Exception:  #IGNORE:W0703
+				return
 		else:
-			# proof file in root directory without the word proof somewhere
-			# no spaces: skip personal covers added to mp3 releases
-			# NOT: desktop.ini, AlbumArtSmall.jpg,
-			# AlbumArt_{7E518F75-1BC4-4CD1-92B4-B349D9E9248B}_Large.jpg
-			# AlbumArt_{7E518F75-1BC4-4CD1-92B4-B349D9E9248B}_Small.jpg
-			if (" " not in os.path.basename(proof) and
-				not os.path.splitext(lproof)[0].endswith("folder") and
-				"albumartsmall" not in os.path.basename(lproof) and
-				not os.path.basename(lproof).startswith("albumart_{")):
-				# must be named like nfo/sfv/rars or start with 00
-				p = os.path.basename(lproof)
-
-				# 00 for mp3 releases. Mostly 00- but 00_ exists too:
-				# VA-Psychedelic_Wild_Diffusion_Part_1-(ESPRODCD01)-CD-2007-hM
-				# or 000- and 01- or 01_
-				if p.startswith(("00", "01")):
-					result.append(proof)
-					continue
-				# idea is to not have covers that are added later
-				# non music releases have a separate folder
-				s = 10  # first X characters
-				if os.path.getsize(proof) > 100000:
-					similar_named = False
-					basenames = []
-					# grab all interesting extensions first
-					for nfo in get_files(reldir, "*.nfo"):
-						basenames.append(os.path.basename(nfo)[:-4])
-					for sfv in get_files(reldir, "*.sfv"):
-						basenames.append(os.path.basename(sfv)[:-4])
-					for rar in rar_files:
-						basenames.append(os.path.basename(rar)[:-4])
-
-					# for music releases, NFOs not always start with 00
-					# while all the other files do (sfv, m3u, jpg, cue,...)
-					# e.g. Hmc_-_187_(UDR011)-VLS-1996-TR
-					for bn in basenames:
-						if bn[:s].lower() == p[:s]:
-							similar_named = True
-							break
-						elif strip_zeros(bn)[:s].lower() == strip_zeros(p)[:s]:
-							similar_named = True
-							break
-						else:
-							# checks possible group name before the extension
-							# e.g. Global_Underground_017_-_Danny_Tenaglia
-							# _(London)-2000-tronik
-							#   /gu_017_tracklisting-tronik.jpg
-							#   /00-global_underground_017_-_danny_tenaglia
-							#     _(london)-2000-tronik.sfv
-							#   /01_gu_017_-_london_(cd_1)-tronik.cue
-							grprls = bn.lower().split('-')[-1]
-							grpimg = os.path.splitext(proof)[0].split('-')[-1]
-							if grprls == grpimg:
-								similar_named = True
-								break
-					if similar_named:
-						result.append(proof)
-					else:
-						tpl = "'{0}' ({1} B) not added to SRR for release {2}"
-						msg = tpl.format(
-							os.path.basename(proof),
-							rescene.utility.sep(os.path.getsize(proof)),
-							os.path.basename(reldir))
-						logging.info(msg)
-						print(msg)
-				else:
-					# TODO: smaller proofs can exist too
-					# -> but .startswith("00") already includes those
-					# maybe extra option to add all image files
-					# and do no separate detection?
-					# -> but even directly from topsite there can be
-					#    additional unwanted files?
-					# small JPGs are most likely site grabs by scripts
-
-					# log and print the small files info too
-					tpl = "'{0}' ({1} B) not added to SRR for release {2}"
-					msg = tpl.format(
-						os.path.basename(proof),
-						rescene.utility.sep(os.path.getsize(proof)),
-						os.path.basename(reldir))
-					logging.info(msg)
-					print(msg)
-			# ATB_-_Seven_Years-Ltd.Ed.-2005-MOD (small JPG image file)
-	for proof in rar_files:
-		if "proof" in proof.lower():
-			# RAR file must contain image file
-			# Space.Dogs.3D.2010.GERMAN.1080p.BLURAY.x264-HDViSiON (bmp proof)
-			for block in RarReader(proof):
-				if block.rawtype == BlockType.RarPackedFile:
-					if (block.file_name[-4:].lower() in
-						(".jpg", "jpeg", ".png", ".bmp", ".gif")):
-						result.append(proof)
-						break
-	return result
+			return
+		return width, height
 
 def remove_unwanted_sfvs(sfv_list, release_dir):
 	"""
@@ -332,7 +466,7 @@ def remove_unwanted_sfvs(sfv_list, release_dir):
 		#     tdk-subs-done.sfv
 		if ("subs" in sfv_name.lower() and
 			# music or release with multiple CDs (xvid)
-			(re.match("^000?-|.*(cd\d|flac).*", sfv_name, re.IGNORECASE) or
+			(re.match(r"^000?-|.*(cd\d|flac).*", sfv_name, re.IGNORECASE) or
 				"subs" in lcrelease_name or
 				"subpack" in lcrelease_name or
 				"vobsub" in lcrelease_name or
@@ -363,15 +497,22 @@ def remove_unwanted_sfvs(sfv_list, release_dir):
 			sfvfiles = rescene.utility.parse_sfv_file(sfv)[0]
 			if len(sfvfiles) == 1:
 				rar = os.path.join(os.path.dirname(sfv), sfvfiles[0].file_name)
+				if not rar.endswith(".rar"):
+					continue  # e.g. .sfv for proof file
 				if os.path.isfile(rar):
 					skip = False
-					for block in RarReader(rar):
-						if block.rawtype == BlockType.RarPackedFile:
-							if (block.file_name[-4:].lower() in
-								(".jpg", "jpeg", ".png", ".bmp", ".gif")):
-								skip = True
-							else:
-								skip = False
+					try:
+						for block in RarReader(rar):
+							if block.rawtype == BlockType.RarPackedFile:
+								if (block.file_name[-4:].lower() in
+									(".jpg", "jpeg", ".png", ".bmp", ".gif")):
+									skip = True
+								else:
+									skip = False
+					except ValueError as e:
+						# No RAR5 support yet
+						logging.warning("{0}: {1}".format(str(e), rar))
+						skip = True
 					if skip:
 						continue
 				else:
@@ -381,7 +522,7 @@ def remove_unwanted_sfvs(sfv_list, release_dir):
 					logging.warning(msg.format(rar))
 					continue
 
-		if re.match(".*Subs.?CD\d$", os.path.dirname(sfv), re.IGNORECASE):
+		if re.match(r".*Subs.?CD\d$", os.path.dirname(sfv), re.IGNORECASE):
 			# Toy.Story.1995.DVDRip.DivX.AC3.iNTERNAL-FFM/
 			# 	Subs/CD1/toyst.subs.cd1-iffm.sfv
 			# The.Postman.1997.DVDRip.XviD.AC3.iNTERNAL-FFM
@@ -516,11 +657,11 @@ def is_storable_fix(release_name):
 	# Ron.White.You.Cant.Fix.Stupid.XviD-LMG
 	# not: Rar|sub|audio|sample|
 	return (re.match(
-			".*(SFV|PPF|sync|proof?|dir|nfo|Interleaving|Trackorder).?"
-			"(Fix|Patch).*", release_name, re.IGNORECASE) or
-			re.match(".*\.(FiX|FIX)(\.|-).*", release_name) or
-			re.match(".*\.DVDR.Fix-.*", release_name) or
-			re.match(".*\.DVDR.REPACK.Fix-.*", release_name))
+			r".*(SFV|PPF|sync|proof?|dir|nfo|Interleaving|Trackorder).?"
+			r"(Fix|Patch).*", release_name, re.IGNORECASE) or
+			re.match(r".*\.(FiX|FIX)(\.|-).*", release_name) or
+			re.match(r".*\.DVDR.Fix-.*", release_name) or
+			re.match(r".*\.DVDR.REPACK.Fix-.*", release_name))
 
 def create_srr_for_subs(unrar, sfv, working_dir, release_dir):
 	"""
@@ -745,7 +886,8 @@ def generate_srr(reldir, working_dir, options, mthread):
 	extra_sfvs = get_unwanted_sfvs(sfvs, main_sfvs)
 
 	# create SRR from RARs or from .mp3 or .flac SFV
-	if len(main_sfvs):
+	# OR it's a fix release without sfv and main rars (just nfo; proof,... dir)
+	if (len(main_sfvs) or (not len(main_sfvs) and not len(main_rars))):
 		try:
 			result = rescene.create_srr(
 			    srr, main_sfvs, reldir, [], True,
@@ -795,7 +937,7 @@ def generate_srr(reldir, working_dir, options, mthread):
 	copied_files = []
 	is_music = False
 	for nfo in get_files(reldir, "*.nfo"):
-		if os.path.basename(nfo).lower() in ("imdb.nfo"):
+		if os.path.basename(nfo).lower() in ("imdb.nfo", "tvmaze.nfo"):
 			continue
 		if os.path.basename(nfo).lower() in ("no.nfo"):
 			try:
@@ -808,7 +950,7 @@ def generate_srr(reldir, working_dir, options, mthread):
 	for m3u in get_files(reldir, "*.m3u"):
 		copied_files.append(copy_to_working_dir(working_dir, reldir, m3u))
 
-	for proof in get_proof_files(reldir):
+	for proof in get_proof_files(reldir, options.more_images):
 		# also does certain Proof RARs and Covers
 		copied_files.append(copy_to_working_dir(working_dir, reldir, proof))
 
@@ -816,7 +958,7 @@ def generate_srr(reldir, working_dir, options, mthread):
 		baselog = os.path.basename(log)
 		# blacklist known file names of transfer logs and hidden files
 		if (baselog.lower() in ("rushchk.log", ".upchk.log", "ufxpcrc.log") or
-			baselog.startswith(b".")):
+			baselog.startswith(".")):
 			continue
 		copied_files.append(copy_to_working_dir(working_dir, reldir, log))
 
@@ -883,6 +1025,7 @@ def generate_srr(reldir, working_dir, options, mthread):
 		if not found:
 			print("Creating SRS for: %s" % path)
 			original_stderr = sys.stderr
+			# TODO: use memory file and write out when needed only
 			txt_error_file = os.path.join(dest_dir,
 				os.path.basename(sample)) + ".txt"
 
@@ -950,10 +1093,13 @@ def generate_srr(reldir, working_dir, options, mthread):
 
 				if advance:
 					tmp_vobsrr_name = create_temp_file_name(vobsrr)
-					rescene.create_srr_single_volume(
-						vobsrr, sample, tmp_srr_name=tmp_vobsrr_name)
-					replace_result(tmp_vobsrr_name, vobsrr)
-					copied_files.append(vobsrr)
+					try:
+						rescene.create_srr_single_volume(
+							vobsrr, sample, tmp_srr_name=tmp_vobsrr_name)
+						replace_result(tmp_vobsrr_name, vobsrr)
+						copied_files.append(vobsrr)
+					except:
+						print("Broken RAR used as vobsample!")
 
 	# when stored SRS file instead of a sample file
 	# or both, but only one SRS will be added
@@ -968,21 +1114,7 @@ def generate_srr(reldir, working_dir, options, mthread):
 
 	# stores the main RARs of DVDR fixes
 	# these RARs contain cracked .exe files and are not wanted on srrdb.com
-	false_positives = [
-		"BEYOND.THE.FUTURE.FIX.THE.TIME.ARROWS.EBOOT.PATCH.100.JPN.PS3-N0DRM",
-		"The.Raven.Legacy.of.a.Master.Thief.FIX-RELOADED",
-		"CHAMPIONSHIP.MANAGER.2003.2004.UPDATE.V4.1.3.PATCH.FIX.CRACKED-DEViANCE",
-		"CHAMPIONSHIP.MANAGER.2003.2004.UPDATE.V4.1.4.TIMER.FIX.CRACKED-DEViANCE",
-		"CHROME.CRACK.FIX-DEViANCE",
-		"F1.Racing.Championship.FIX.READ.NFO-HOTDOX",
-		"Hunting_Unlimited_3_V1.1_NOCD_CRACK_NFOFIX-RVL",
-		"LMA.Manager.2007.FiX-RELOADED",
-		"MSC.PATRAN.V2001.R2A.FIX.FOR.RISE-TFL",
-		"RUNAWAY.A.ROAD.ADVENTURE.FIX-DEViANCE",
-		"Bubble.Boy.DVDRip.DiVX.FIX-FIXRUS",  # contains vobsubs
-		# missing file main release
-		"Super.Streetfighter.IV.SSFIV.Arcade.Edition.DLC.FIX.READNFO.XBOX360-MoNGoLS",
-		]
+	false_positives = rar_file_blacklist()
 	release_name = os.path.split(reldir)[1]
 	if (is_storable_fix(release_name) and
 		len(main_sfvs) == 1 and len(main_rars) == 1 and
@@ -1179,11 +1311,8 @@ def get_release_directories(path):
 			except:
 				yield last_release
 
-# The_Guy_Game_USA_DVD9_XBOX-WoD: PART1/wod-guy.part001.sfv
-DISK_FOLDERS = re.compile("^(CD|DISK|DVD|DISC|PART)_?\d\d?$", re.IGNORECASE)
-RELEASE_FOLDERS = re.compile("^((CD|DISK|DVD|DISC|PART)_?\d\d?|(Vob)?Samples?|"
-	"Covers?|Proofs?|Subs?(pack)?|(vob)?subs?)$", re.IGNORECASE)
-NOT_SCENE = ["motechnetfiles.nfo", "movie.nfo", "imdb.nfo", "scc.nfo"]
+NOT_SCENE = ["motechnetfiles.nfo", "movie.nfo", "scc.nfo",
+             "imdb.nfo", "tvmaze.nfo"]
 
 def is_release(dirpath, dirnames=None, filenames=None):
 	if dirnames is None or filenames is None:
@@ -1207,20 +1336,30 @@ def is_release(dirpath, dirnames=None, filenames=None):
 
 	custom_dirs_old_music = []
 	OLD_MP3_LIMIT = 10  # arbitrary amount of possible folders we expect
+	NO_HYPHEN = re.compile("^[a-zA-Z0-9_]+$", re.IGNORECASE)  # no -
+	rls_candidate = os.path.basename(dirpath)
+
 	if not release:
 		# SFV file in one of the interesting subdirs?
-		interesting_dirs = []
+		common_subfolders = []
+		
 		for dirname in dirnames:
 			# Disc_1 and Disc_2 in mp3 rlz
 			if DISK_FOLDERS.match(dirname):
-				interesting_dirs.append(dirname)
-			elif re.match("^[a-zA-Z0-9_]+$", dirname, re.IGNORECASE):
+				# Resident_Evil_2_NTSC-US_DC-OVERRiDE (r00 is first rar)
+				#   Disc1.Leon and Disc2.Claire
+				common_subfolders.append(dirname)
+			elif NO_HYPHEN.match(dirname):
 				# old MP3 release with custom folders
 				custom_dirs_old_music.append(dirname)
+			elif re.match(r"CD(.?|_-_)\d{1-2}.+", dirname, re.IGNORECASE):
+				# Various_artists_-_deiner_tracks_vol2_2cd-2000-nbd
+				# CD1-Dj_Membrain and CD2-Dj_Sepalot
+				custom_dirs_old_music.append(dirname)
 
-		for idir in interesting_dirs:
+		for idir in common_subfolders:
 			for lfile in os.listdir(os.path.join(dirpath, idir)):
-				if lfile[-4:].lower() == ".sfv":
+				if lfile.lower().endswith(".sfv"):
 					release = True
 					break
 			if release:
@@ -1239,25 +1378,34 @@ def is_release(dirpath, dirnames=None, filenames=None):
 					if lfile.lower().endswith(".sfv"):
 						sfv_count += 1
 						break
+			# release if no other release folders are found either
 			release = len(dirnames) == sfv_count and sfv_count >= 2
 
 	# X3.Gold.Edition-Unleashed has DISC
-	if release and not RELEASE_FOLDERS.match(os.path.basename(dirpath)):
+	if release and not RELEASE_FOLDERS.match(rls_candidate):
 		release = True
 	else:
 		return False
 
-	# season torrent packs have often an additional NFO file in the root
+	# SEASON TORRENT PACKS have often an additional NFO file in the root
 	# don't detect as a release if this is the case
-	# only difference with old music releases is the '-' in the folder name
+	# only difference with old music releases is the '-' in the subfolder name
 	if len(filenames) == 1 and filenames[0].lower().endswith(".nfo"):
 		# could still be a regular release with multiple CDs
 		# each other subdir must be a release dir -> not reldir itself
-		is_no_pack = False
+		is_pack = True
 		for reldir in dirnames:
-			if not is_release(os.path.join(dirpath, reldir)):
-				is_no_pack = True
+			# ignore empty directories
+			full_path = os.path.join(dirpath, reldir)
+			a_release = is_release(full_path)
+			contains_files = len(os.listdir(full_path))
+			if not a_release and contains_files:
+				is_pack = False
 				break
+			
+		# nfofix, dirfix have no subfolders
+		if not len(dirnames):
+			is_pack = False
 
 		# MP3 release falsely detected as torrent site pack (nfo in root)
 		# Nine_Inch_Nails-The_Fragile_2CD-1999-Sinned-aPC
@@ -1272,11 +1420,11 @@ def is_release(dirpath, dirnames=None, filenames=None):
 		#         00-nine_inch_nails-the_fragile_2cd-1999-sinned-apc.nfo
 		#         00-nine_inch_nails-the_fragile_right-1999-sinned-apc.m3u
 		#         00-nine_inch_nails-the_fragile_right-1999-sinned-apc.sfv
-		if (not is_no_pack and len(custom_dirs_old_music) == 0 and
+		if (is_pack and len(custom_dirs_old_music) == 0 and
 			len(dirnames) <= OLD_MP3_LIMIT):
 			for dirname in dirnames:
 				# old MP3 release with custom folders (no '-' in name)
-				if re.match("^[a-zA-Z0-9_]+$", dirname, re.IGNORECASE):
+				if NO_HYPHEN.match(dirname):
 					custom_dirs_old_music.append(dirname)
 
 			sfv_count = 0
@@ -1287,7 +1435,7 @@ def is_release(dirpath, dirnames=None, filenames=None):
 						break
 			release = len(dirnames) == sfv_count and sfv_count >= 2
 		else:
-			release = is_no_pack
+			release = not is_pack
 
 	# a release name doesn't have spaces in its folder name
 	(head, tail) = os.path.split(dirpath)
@@ -1299,10 +1447,7 @@ def is_release(dirpath, dirnames=None, filenames=None):
 	return release
 
 def is_empty_file(fpath):
-	if os.path.isfile(fpath) and os.path.getsize(fpath) == 0:
-		return True
-	else:
-		return False
+	return os.path.isfile(fpath) and os.path.getsize(fpath) == 0
 
 def main(argv=None):
 	start_time = datetime.now()
@@ -1346,6 +1491,12 @@ def main(argv=None):
 					help="set custom temporary directory")
 					# used for vobsub creation
 
+	parser.add_option("-i", "--include-images",
+	                  dest="more_images", action="store_true",
+	                  help="Include smaller and differently named image files."
+	                  " Use this option when you know there are no "
+	                  "covers or other images "
+	                  "added to the (music) releases afterwards.")
 	parser.add_option("-x", "--skip",
 	                  dest="skip_list", metavar="NAME", action="append",
 	                  help="exclude these files from the stored files")
@@ -1357,7 +1508,7 @@ def main(argv=None):
 	                  help="regex to skip files files to store. matched to "
 	                  "the path inside the release dir. "
 	                  "use ^ and $ to match whole path. "
-	                  "e.g. ^.*/sitename\.nfo$ (case ignored)")
+	                  r"e.g. ^.*/sitename\.nfo$ (case ignored)")
 
 	# speedup rerun, less traffic, backup textfiles, ...
 	parser.add_option("--no-srs", action="store_true", dest="nosrs",
@@ -1545,15 +1696,15 @@ def main(argv=None):
 		global skipre
 		try:
 			skipre = re.compile(options.skip_regex, re.IGNORECASE)
-			if skipre.match("test.sfv"):
+			if skipre.match(r"test.sfv"):
 				msg = "Not a good idea to ignore SFV files in the regex!"
 				logging.warning(msg)
 		except Exception as e:
 			# use --skip-regex "*" to trigger this
 			print("Unrecognized regular expression: %s" % e)
 			print("Some examples: (case always ignored)")
-			print("\t^.*/sitename\.nfo$")
-			print("\t^sample/.*\._s.jpg$")
+			print(r"\t^.*/sitename\.nfo$")
+			print(r"\t^sample/.*\._s.jpg$")
 			return 1  # failure
 
 	drive_letters = []

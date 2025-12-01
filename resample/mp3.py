@@ -206,12 +206,14 @@ class Mp3Reader(object):
 			# the bad initial tag first.
 			# This can cause the space between the "ID3" and the end tag
 			# to be empty. (or just wrong)
-			# This does not handle repeating of ID3v2 tags.
 			# Mickey_K.-Distracted-(DNR019F8)-WEB-2008-B2R has the 'ID3' string
 			# in the ID3v2 tag for 02-mickey_k.-distracted_-_dub_mix.mp3
 			last_id3 = last_id3v2_before_sync(self._mp3_stream,
 			                                  self._file_length)
-			if last_id3 != last_id3v2.start_pos:  # dupe ID3 string
+			dupe_id3_string = last_id3 != last_id3v2.start_pos
+			after_v2_tag = last_id3 >= last_id3v2.start_pos + last_id3v2.size
+			if dupe_id3_string and after_v2_tag:
+				# another 'ID3' string found after id3v2 tag
 				self._mp3_stream.seek(last_id3 + 3 + 3, os.SEEK_SET)
 				sbytes = self._mp3_stream.read(4)
 				size = decode_id3_size(sbytes)
@@ -219,6 +221,19 @@ class Mp3Reader(object):
 				begin_main_content = last_id3 + 10 + size  # 3 + 3 + 4
 				# add extra amount of data to the last block
 				last_id3v2.size = begin_main_content - last_id3v2.start_pos
+			elif dupe_id3_string and not after_v2_tag:
+				# another 'ID3' string found inside first id3v2 tag
+				if begin_main_content > self._file_length:
+					# first tag is corrupt by definition
+					# assume latter tag to be the good one: parse it
+					# skip 'ID3' + ID3v2 version (2 bytes) and flags (1 byte)
+					self._mp3_stream.seek(last_id3 + 6, os.SEEK_SET)
+					sbytes = self._mp3_stream.read(4)
+					size = decode_id3_size(sbytes)
+					tag_size = 10 + size  # 3 + 3 + 4
+					last_id3v2 = Block(tag_size, "ID3", last_id3)
+					self.blocks.append(last_id3v2)
+					begin_main_content = last_id3 + tag_size
 
 		self._mp3_stream.seek(begin_main_content, os.SEEK_SET)
 		marker = self._mp3_stream.read(4)

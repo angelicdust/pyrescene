@@ -24,6 +24,7 @@ Download zlib compiled DLL from http://zlib.net/ for more speed and
 put it in your PATH. See http://www.computerhope.com/issues/ch000549.htm
 Use the pyReScene folder structure or 
 copy rescene/crc32combine.py to the same folder as this file.
+https://sourceforge.net/projects/libpng/files/zlib/1.2.8/
 
 RUN
 ---
@@ -53,6 +54,9 @@ Possible improvements:
 - is PyPy a speed improvement? (it works with PyPy)
   How does the pure Python combine code compare with calling zlib from Python?
 - better output file handling instead of (overwriting) the default .fixed
+
+Bugs:
+- doing the whole range on large files (100MB), will create an empty file
 
 Author: Gfy"""
 
@@ -119,7 +123,7 @@ def main(options, args):
 	# memoization: precalculate crc32 hashes
 	# 	crc32(crc32(0, seq1, len1), seq2, len2) ==
 	# 		crc32_combine(crc32(0, seq1, len1), crc32(0, seq2, len2), len2)
-	skip = options.skip  # 100 by default
+	skip = options.skip  # 1000 by default
 	lookup = {}
 	crc_begin = crc32(data[0:range_start]) & 0xFFFFFFFF
 	crc_begin_len = len(data[0:range_start])
@@ -262,7 +266,7 @@ def main(options, args):
 				continue  # executed if the loop ended normally (no break)
 
 		# write out good file
-		outfn = file_name + ".fixed"
+		outfn = file_name + "." + str(cur_byte) + ".fixed"
 		print("Writing fixed file to %s" % outfn)
 		with open(outfn, 'wb') as result:
 			result.write(data[start:cur_byte])
@@ -283,7 +287,8 @@ if __name__ == '__main__':
 		usage="Usage: %prog file_name CRC32 [range start] [range end]\n"
 		"This tool will flip each bit and stops when a CRC match is found.\n"
 		"CRC32: expected hash of the full file\n"
-		"range: location in the file to search for a flip\n",
+		"range: location in the file to search for a flip\n"
+		"Download zlib.dll: https://sourceforge.net/projects/libpng/files/zlib/1.2.8/",
 		version="%prog 0.3 (2016-03-01)")  # --help, --version
 
 	parser.add_option("-s", "--skip", help="amount of bytes for window that "

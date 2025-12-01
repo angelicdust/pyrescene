@@ -24,11 +24,15 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-from distutils.core import setup
-from distutils.command.build_py import build_py
 import os
 import sys
 import rescene
+if sys.version_info.major == 2:
+    from distutils.core import setup
+    from distutils.command.build_py import build_py
+else:
+    from setuptools import setup
+    from setuptools.command.build_py import build_py
 
 try:
 	import py2exe  # @UnresolvedImport #@UnusedImport
@@ -105,7 +109,6 @@ config_dict = {
 	            "mp3", "flac", "retag"],
     "classifiers": [
 		"Development Status :: 5 - Production/Stable",
-        "Programming Language :: Python :: 2.6",
         "Programming Language :: Python :: 2.7",
         "Programming Language :: Python :: 3.2",
         "Programming Language :: Python :: 3.3",

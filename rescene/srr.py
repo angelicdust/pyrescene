@@ -77,7 +77,11 @@ class MessageThread(Thread):
 			if len(o.events):
 				for event in o.events:
 					if event.code in self.messages or self.all:
-						print(event.message, file=sys.stderr)
+						# common info messages to stdout
+						if event.code in MsgCode.informative:
+							print(event.message)
+						else:
+							print(event.message, file=sys.stderr)
 				o.events = []
 			time.sleep(self.sleeptime)  # in seconds
 		return
@@ -159,6 +163,9 @@ def verify_extracted_files(srr, in_folder, auto_locate):
 	if len(archived_files) == 0:
 		status = 10  # it's a music release
 	for afile in archived_files:
+		# Replace rar default directory separator with slash when used by OS
+		if os.sep == '/':
+			afile.file_name = afile.file_name.replace('\\', '/')
 		# skip the directories and empty files
 		if afile.crc32 != "00000000" and afile.crc32 != "0":
 			name = os.path.join(in_folder, afile.file_name)
@@ -300,12 +307,17 @@ def manage_srr(options, in_folder, infiles, working_dir):
 				except:
 					parser.exit(1, "Invalid hint (-H) value: %s" % hint)
 
+		rar_mt = rescene.RarMtSettings()
+		rar_mt.mt_set = options.mt_set
+		rar_mt.mt_min = options.mt_min
+		rar_mt.mt_max = options.mt_max
+
 		try:
 			rescene.reconstruct(infiles[0], in_folder, out_folder, save_paths,
 			                    hints, options.no_auto_crc,
 			                    options.auto_locate, options.fake,
 			                    options.rar_executable_dir, options.temp_dir,
-			                    options.volume is None, options.volume)
+			                    options.volume is None, options.volume, rar_mt)
 		except (FileNotFound, RarNotFound) as err:
 			mthread.done = True
 			mthread.join()
@@ -406,10 +418,12 @@ def main(argv=None):
 	creation = optparse.OptionGroup(parser, "Creation options")
 	recon = optparse.OptionGroup(parser, "Reconstruction options")
 	edit = optparse.OptionGroup(parser, "Edit options")
+	comprr = optparse.OptionGroup(parser, "Compressed reconstruction options")
 	parser.add_option_group(display)
 	parser.add_option_group(creation)
 	parser.add_option_group(recon)
 	parser.add_option_group(edit)
+	parser.add_option_group(comprr)
 
 	parser.add_option("-y", "--always-yes", dest="always_yes", default=False,
 					  action="store_true",
@@ -419,6 +433,9 @@ def main(argv=None):
 					  help="assume N(o) for all prompts")
 	parser.add_option("-v", help="enable verbose (technical) creation",
 						action="store_true", dest="verbose", default=False)
+	parser.add_option("-q", "--verify",
+					  action="store_true", dest="verify", default=False,
+					  help="CRC verify extracted RAR contents")
 	# TODO: get all the messages in order
 
 	display.add_option("-l", "--list",
@@ -427,9 +444,6 @@ def main(argv=None):
 	display.add_option("-e", "--details",
 					  action="store_true", dest="list_details", default=False,
 					  help="list detailed SRR file info")
-	display.add_option("-q", "--verify",
-					  action="store_true", dest="verify", default=False,
-					  help="verify extracted RAR contents")
 
 	creation.add_option("-c", "--compressed",
 					 action="store_true", dest="allow_compressed",
@@ -492,6 +506,30 @@ def main(argv=None):
 	edit.add_option("-s", help="<file list>: Store additional files in the"
 	                " SRR (wildcards supported)", action="append",
 	                metavar="FILES", dest="store_files")
+	
+	def integer_list(option, opt_str, value, parser):
+		try:
+			value = [int(mt) for mt in value.split(",")]
+		except:
+			error_msg = "%s expects only numbers and commas" % opt_str
+			raise optparse.OptionValueError(error_msg)
+		setattr(parser.values, option.dest, value)
+		
+	comprr.set_description("Set the rar -mt thread parameter to exclude "
+		"certain possibilities when reconstructing compressed RARs.")
+	comprr.add_option("--mt-set", callback=integer_list,
+	                  action="callback", type="string", dest="mt_set",
+	                  help="list of possible thread values. e.g. 4,6,8")
+	comprr.add_option("--mt-min", default=0,
+	                  action="store", type="int", dest="mt_min",
+	                  help="minimum thread count to try. e.g. 24")
+	comprr.add_option("--mt-max", default=0,
+	                  action="store", type="int", dest="mt_max",
+	                  help="maximum thread count to try. e.g. 2")
+	comprr.add_option("--mt-common",
+	                  const=[1, 2, 4, 6, 8, 12, 16, 24, 32],
+	                  action="store_const", dest="mt_set",
+	                  help="same as --mt-set 1,2,4,6,8,12,16,24,32")
 
 	if argv is None:
 		argv = sys.argv[1:]
@@ -545,6 +583,7 @@ WARNING: SRR files for compressed RARs are like SRS files:
 		working_dir = os.path.abspath(os.path.curdir)
 
 		# check existence and type of the input files
+		# help to stderr http://www.jstorimer.com/blogs/workingwithcode/7766119
 		for infile in infiles:
 			ext = infile[-4:].lower()
 			if not os.path.exists(infile):
